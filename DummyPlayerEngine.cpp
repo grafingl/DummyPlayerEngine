@@ -12,6 +12,10 @@
 //   Bikes=1   мотоциклы (SA, VC)
 //   Quads=1   квадроциклы (только SA)
 // 1 = звук как у NPC, 0 = обычный звук игрока. Без файла всё включено.
+//   Volume=100  громкость NPC-звука двигателя игрока в процентах (только GTA III и VC).
+//               100 = как у NPC. Итог ограничен максимумом игры (127).
+//   WorldVolume=100  громкость остальных звуков мира, пока игрок в транспорте, в процентах
+//               (только GTA III и VC). 100 = без изменений, 0 = тишина.
 //
 // San Andreas:
 //   Если включено всё, в начало CAEVehicleAudioEntity::ProcessPlayerVehicleEngine
@@ -40,6 +44,15 @@
 //   Условный переход "не машина игрока" (jne, 0x56A6BF) заменяется на безусловный.
 //   Мотоциклов в GTA III нет, поэтому учитывается только Cars.
 //   Перед патчем мод сверяет байты вокруг этого места.
+//
+// Громкость (GTA III и VC):
+//   В ветке NPC громкость сэмпла двигателя (emittingVol, 80..120 из 127) лежит
+//   в локальной переменной и перед вызовом cAudioManager::ComputeVolume читается
+//   инструкцией "mov al, [esp+N]; mov ecx, ebx". Эти 6 байт заменяются вызовом
+//   заглушки, которая для машины игрока умножает emittingVol на Volume/100
+//   (не больше 127), а затем делает то же, что оригинал. Дальше игра использует
+//   эту же переменную и для m_nEmittingVolume сэмпла, поэтому громче становится
+//   именно звук. Машины NPC не меняются.
 
 #include <windows.h>
 #include <stdint.h>
@@ -69,7 +82,7 @@ static bool BytesEqual(uintptr_t addr, const uint8_t* bytes, size_t size) {
 static void WriteBytes(uintptr_t addr, const uint8_t* bytes, size_t size) {
     DWORD oldProt;
     VirtualProtect((void*)addr, size, PAGE_EXECUTE_READWRITE, &oldProt);
-    uint8_t* p = (uint8_t*)addr;
+    volatile uint8_t* p = (volatile uint8_t*)addr; // volatile: без memcpy/memset из CRT
     for (size_t i = 0; i < size; ++i) p[i] = bytes[i];
     VirtualProtect((void*)addr, size, oldProt, &oldProt);
     FlushInstructionCache(GetCurrentProcess(), (void*)addr, size);
@@ -90,6 +103,92 @@ static bool g_cars  = true;
 static bool g_bikes = true;
 static bool g_quads = true;
 
+extern "C" {
+    uint32_t dpe_volume __asm__("dpe_volume") = 100; // проценты
+}
+
+static uint32_t g_worldVolume = 100; // проценты, 0..100
+
+// ---------- Приглушение мира (GTA III и VC) ----------
+//
+// Почти все звуки мира ставятся в очередь через cAudioManager::AddSampleToRequestedQueue,
+// которая берёт уже заполненный m_sQueueSample. В начало этой функции ставится переход
+// на вставку, которая, пока игрок в транспорте, уменьшает громкость сэмпла
+// (m_nEmittingVolume и m_nVolume) на WorldVolume процентов. Не трогаются:
+//   - 2D-звуки (меню, интерфейс);
+//   - звуки ближе OWN_RADIUS метров к машине игрока: её двигатель, гудок, шины,
+//     двери, удары по ней. У всех звуков машины позиция сэмпла = позиция машины.
+// Поля одинаковые в III и VC (проверено по дизассемблеру exe 1.0):
+//   this+0x21  m_sQueueSample.m_bIs2D
+//   this+0x2C  m_sQueueSample.m_nVolume
+//   this+0x40  m_sQueueSample.m_nEmittingVolume
+//   this+0x50  m_sQueueSample.m_vecPos
+//   veh+0x34   позиция машины (CPlaceable::m_matrix.pos)
+
+static const float OWN_RADIUS = 5.0f;
+static uintptr_t g_findPlayerVehicle = 0;
+
+extern "C" __attribute__((fastcall)) void DuckWorld(uint8_t* am) __asm__("dpe_duck_world");
+extern "C" __attribute__((fastcall)) void DuckWorld(uint8_t* am) {
+    uint8_t* veh = ((uint8_t*(__cdecl*)())g_findPlayerVehicle)();
+    if (!veh || am[0x21]) {
+        return;
+    }
+    const float* s = (const float*)(am + 0x50);
+    const float* v = (const float*)(veh + 0x34);
+    const float dx = s[0] - v[0], dy = s[1] - v[1], dz = s[2] - v[2];
+    if (dx * dx + dy * dy + dz * dz < OWN_RADIUS * OWN_RADIUS) {
+        return;
+    }
+    am[0x40] = (uint8_t)(am[0x40] * g_worldVolume / 100);
+    am[0x2C] = (uint8_t)(am[0x2C] * g_worldVolume / 100);
+}
+
+// Начало AddSampleToRequestedQueue переносится во вставку, после неё возврат назад.
+extern "C" {
+    uintptr_t dpe_iii_queue_back __asm__("dpe_iii_queue_back") = 0x57B077;
+    uintptr_t dpe_vc_queue_back  __asm__("dpe_vc_queue_back")  = 0x5F7568;
+}
+extern "C" void IIIQueueStub() __asm__("dpe_iii_queue_stub");
+extern "C" void VcQueueStub()  __asm__("dpe_vc_queue_stub");
+__asm__(
+    ".text\n"
+    ".globl dpe_iii_queue_stub\n"
+    "dpe_iii_queue_stub:\n"
+    "    pushal\n"
+    "    call   dpe_duck_world\n"        // ecx = this
+    "    popal\n"
+    "    pushl  %ebx\n"                  // оригинал 0x57B070:
+    "    pushl  %ebp\n"
+    "    movl   %ecx, %ebp\n"
+    "    subl   $8, %esp\n"
+    "    jmp    *dpe_iii_queue_back\n"
+    ".globl dpe_vc_queue_stub\n"
+    "dpe_vc_queue_stub:\n"
+    "    pushal\n"
+    "    call   dpe_duck_world\n"
+    "    popal\n"
+    "    pushl  %ebx\n"                  // оригинал 0x5F7560:
+    "    pushl  %esi\n"
+    "    movl   %ecx, %ebx\n"
+    "    pushl  %ebp\n"
+    "    subl   $0x18, %esp\n"
+    "    jmp    *dpe_vc_queue_back\n"
+);
+
+static bool HookQueue(uintptr_t at, const uint8_t* orig, size_t size, void* stub) {
+    if (!BytesEqual(at, orig, size)) {
+        return false;
+    }
+    static const uint8_t nops[3] = { 0x90, 0x90, 0x90 };
+    WriteJmp(at, (uintptr_t)stub);
+    WriteBytes(at + 5, nops, size - 5);
+    return true;
+}
+
+static const uint8_t III_QUEUE_ORIGINAL[7] = { 0x53, 0x55, 0x89, 0xCD, 0x83, 0xEC, 0x08 };
+static const uint8_t VC_QUEUE_ORIGINAL[8]  = { 0x53, 0x56, 0x89, 0xCB, 0x55, 0x83, 0xEC, 0x18 };
+
 static void LoadConfig(HINSTANCE hinst) {
     wchar_t path[MAX_PATH];
     DWORD len = GetModuleFileNameW(hinst, path, MAX_PATH);
@@ -108,7 +207,48 @@ static void LoadConfig(HINSTANCE hinst) {
     g_cars  = GetPrivateProfileIntW(sec, L"Cars",  1, path) != 0;
     g_bikes = GetPrivateProfileIntW(sec, L"Bikes", 1, path) != 0;
     g_quads = GetPrivateProfileIntW(sec, L"Quads", 1, path) != 0;
+
+    int vol = (int)GetPrivateProfileIntW(sec, L"Volume", 100, path);
+    if (vol < 0)    vol = 0;
+    if (vol > 1000) vol = 1000;
+    dpe_volume = (uint32_t)vol;
+
+    int world = (int)GetPrivateProfileIntW(sec, L"WorldVolume", 100, path);
+    if (world < 0)   world = 0;
+    if (world > 100) world = 100;
+    g_worldVolume = (uint32_t)world;
 }
+
+// Заменяет 6 байт "mov al, [esp+N]; mov ecx, ebx" на "call stub; nop".
+static void WriteVolumeCall(uintptr_t at, void* stub) {
+    const int32_t rel = (int32_t)((uintptr_t)stub - (at + 5));
+    const uint8_t code[6] = {
+        0xE8,
+        (uint8_t)(rel), (uint8_t)(rel >> 8), (uint8_t)(rel >> 16), (uint8_t)(rel >> 24),
+        0x90,
+    };
+    WriteBytes(at, code, sizeof(code));
+}
+
+// Общая часть заглушек громкости: emittingVol = min(127, emittingVol * Volume / 100).
+// Адрес байта громкости в ecx. Портит eax, edx.
+__asm__(
+    ".text\n"
+    "dpe_scale_vol:\n"
+    "    movzbl (%ecx), %eax\n"
+    "    imull  dpe_volume, %eax\n"
+    "    pushl  %ecx\n"
+    "    xorl   %edx, %edx\n"
+    "    movl   $100, %ecx\n"
+    "    divl   %ecx\n"
+    "    popl   %ecx\n"
+    "    cmpl   $127, %eax\n"
+    "    jbe    1f\n"
+    "    movl   $127, %eax\n"
+    "1:\n"
+    "    movb   %al, (%ecx)\n"
+    "    ret\n"
+);
 
 static void Warn(const wchar_t* text) {
     MessageBoxW(nullptr, text, L"DummyPlayerEngine", MB_OK | MB_ICONWARNING);
@@ -231,6 +371,47 @@ __asm__(
     "    jmp    *dpe_vc_npc\n"
 );
 
+// Громкость. Код 0x5F273F..0x5F2752 (ветка NPC, esp+0xC = emittingVol, edi = cVehicleParams*):
+//   fcompp; fcompp
+//   mov  al, [esp+0xC]            ; <- 0x5F2743, заменяется на call dpe_vc_vol_stub; nop
+//   mov  ecx, ebx
+//   push dword [ebx+0x30]         ; дистанция
+//   push dword [0x6B2668]         ; 50.0
+//   push eax
+//   call 0x5F7A20                 ; cAudioManager::ComputeVolume
+static const uintptr_t VC_VOL_SITE = 0x5F273F;
+static const uint8_t VC_VOL_ORIGINAL[] = {
+    0xDE, 0xD9, 0xDE, 0xD9,             // fcompp; fcompp
+    0x8A, 0x44, 0x24, 0x0C,             // mov al, [esp+0xC]
+    0x89, 0xD9,                         // mov ecx, ebx
+    0xFF, 0x73, 0x30,                   // push dword ptr [ebx+0x30]
+};
+static const uintptr_t VC_VOL_CALL = 0x5F2743;
+
+// FindPlayerVehicle (0x4BC1E0) портит только eax и ecx, FPU-стек здесь пуст.
+extern "C" void VcVolStub() __asm__("dpe_vc_vol_stub");
+__asm__(
+    ".text\n"
+    ".globl dpe_vc_vol_stub\n"
+    "dpe_vc_vol_stub:\n"
+    "    pushl  %edx\n"
+    "    movl   $0x4bc1e0, %eax\n"
+    "    call   *%eax\n"                 // FindPlayerVehicle()
+    "    testl  %eax, %eax\n"
+    "    je     1f\n"
+    "    cmpl   0xc(%edi), %eax\n"       // params.m_pVehicle == машина игрока?
+    "    jne    1f\n"
+    "    cmpw   $0xbb, 0x5c(%eax)\n"     // гольф-кар звучит как NPC и без мода, не трогаем
+    "    je     1f\n"
+    "    leal   0x14(%esp), %ecx\n"      // emittingVol (esp+0xC у вызывающего)
+    "    call   dpe_scale_vol\n"
+    "1:\n"
+    "    popl   %edx\n"
+    "    movzbl 0x10(%esp), %eax\n"      // mov al, [esp+0xC]
+    "    movl   %ebx, %ecx\n"            // mov ecx, ebx
+    "    ret\n"
+);
+
 static bool IsVC10() {
     static const uint8_t entry[4] = { 0x55, 0x89, 0xE5, 0x53 };
     return BytesEqual(0x667BF0, entry, sizeof(entry));
@@ -253,6 +434,21 @@ static bool PatchVC() {
         code[3] = (uint8_t)(rel >> 16); code[4] = (uint8_t)(rel >> 24);
         for (int i = 5; i < 11; ++i) code[i] = 0x90; // nop
         WriteBytes(VC_CADDY_CHECK, code, sizeof(code));
+    }
+    if (dpe_volume != 100 && (g_cars || g_bikes)) {
+        if (BytesEqual(VC_VOL_SITE, VC_VOL_ORIGINAL, sizeof(VC_VOL_ORIGINAL))) {
+            WriteVolumeCall(VC_VOL_CALL, (void*)&VcVolStub);
+        } else {
+            Warn(L"DummyPlayerEngine: место для громкости в Vice City не совпадает с версией 1.0.\n"
+                 L"Звук двигателя работает, но настройка Volume не применена.");
+        }
+    }
+    if (g_worldVolume != 100) {
+        g_findPlayerVehicle = 0x4BC1E0;
+        if (!HookQueue(0x5F7560, VC_QUEUE_ORIGINAL, sizeof(VC_QUEUE_ORIGINAL), (void*)&VcQueueStub)) {
+            Warn(L"DummyPlayerEngine: очередь звуков Vice City не совпадает с версией 1.0\n"
+                 L"(возможно, её уже изменил другой мод). Настройка WorldVolume не применена.");
+        }
     }
     return true;
 }
@@ -282,6 +478,45 @@ static const uint8_t III_ORIGINAL[] = {
 };
 static const uintptr_t III_JNE = 0x56A6BF;
 
+// Громкость. Код 0x56AA66..0x56AA79 (ветка NPC, esp+8 = emittingVol, ebp = машина):
+//   fcompp; fcompp
+//   mov  al, [esp+8]              ; <- 0x56AA6A, заменяется на call dpe_iii_vol_stub; nop
+//   mov  ecx, ebx
+//   push dword [ebx+0x30]         ; дистанция
+//   push dword [0x606A34]         ; 50.0
+//   push eax
+//   call 0x57ABB0                 ; cAudioManager::ComputeVolume
+static const uintptr_t III_VOL_SITE = 0x56AA66;
+static const uint8_t III_VOL_ORIGINAL[] = {
+    0xDE, 0xD9, 0xDE, 0xD9,             // fcompp; fcompp
+    0x8A, 0x44, 0x24, 0x08,             // mov al, [esp+8]
+    0x89, 0xD9,                         // mov ecx, ebx
+    0xFF, 0x73, 0x30,                   // push dword ptr [ebx+0x30]
+};
+static const uintptr_t III_VOL_CALL = 0x56AA6A;
+
+// FindPlayerVehicle (0x4A10C0) портит только eax и ecx, FPU-стек здесь пуст.
+extern "C" void IIIVolStub() __asm__("dpe_iii_vol_stub");
+__asm__(
+    ".text\n"
+    ".globl dpe_iii_vol_stub\n"
+    "dpe_iii_vol_stub:\n"
+    "    pushl  %edx\n"
+    "    movl   $0x4a10c0, %eax\n"
+    "    call   *%eax\n"                 // FindPlayerVehicle()
+    "    testl  %eax, %eax\n"
+    "    je     1f\n"
+    "    cmpl   %ebp, %eax\n"            // машина игрока?
+    "    jne    1f\n"
+    "    leal   0x10(%esp), %ecx\n"      // emittingVol (esp+8 у вызывающего)
+    "    call   dpe_scale_vol\n"
+    "1:\n"
+    "    popl   %edx\n"
+    "    movzbl 0xc(%esp), %eax\n"       // mov al, [esp+8]
+    "    movl   %ebx, %ecx\n"            // mov ecx, ebx
+    "    ret\n"
+);
+
 static bool IsIII10() {
     static const uint8_t entry[8] = { 0x55, 0x89, 0xE5, 0x53, 0x83, 0xEC, 0x48, 0x55 };
     return BytesEqual(0x5C1E70, entry, sizeof(entry));
@@ -294,6 +529,22 @@ static bool PatchIII() {
     if (g_cars) {
         static const uint8_t jmpShort[1] = { 0xEB }; // jne -> jmp
         WriteBytes(III_JNE, jmpShort, sizeof(jmpShort));
+
+        if (dpe_volume != 100) {
+            if (BytesEqual(III_VOL_SITE, III_VOL_ORIGINAL, sizeof(III_VOL_ORIGINAL))) {
+                WriteVolumeCall(III_VOL_CALL, (void*)&IIIVolStub);
+            } else {
+                Warn(L"DummyPlayerEngine: место для громкости в GTA III не совпадает с версией 1.0.\n"
+                     L"Звук двигателя работает, но настройка Volume не применена.");
+            }
+        }
+    }
+    if (g_worldVolume != 100) {
+        g_findPlayerVehicle = 0x4A10C0;
+        if (!HookQueue(0x57B070, III_QUEUE_ORIGINAL, sizeof(III_QUEUE_ORIGINAL), (void*)&IIIQueueStub)) {
+            Warn(L"DummyPlayerEngine: очередь звуков GTA III не совпадает с версией 1.0\n"
+                 L"(возможно, её уже изменил другой мод). Настройка WorldVolume не применена.");
+        }
     }
     return true;
 }
