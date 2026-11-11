@@ -19,9 +19,10 @@
 //   VolumeSA=100, WorldVolumeSA=100  то же для San Andreas. Там проценты переводятся
 //               в дБ: 20 * log10(значение / 100).
 //   Если строки нет, значение 100, то есть как в игре.
-//   ReloadKey=F7  клавиша, по которой ini перечитывается прямо в игре (F1..F24, буква,
-//               цифра или код клавиши Windows). 0 = выключено. Сама ReloadKey читается
-//               только при запуске.
+//   ReloadKey=F7  клавиша, по которой ini перечитывается прямо в игре (F1..F12, буква,
+//               цифра или их код клавиши Windows, например 118 или 0x76 = F7).
+//               0 = выключено. Клавиша читается из состояния клавиатуры игры, как
+//               в CLEO-модах. Сама ReloadKey читается только при запуске.
 //
 // Перечитывание на лету:
 //   San Andreas: вызовы ProcessPlayerVehicleEngine всегда идут через обёртку. При смене
@@ -31,7 +32,7 @@
 //   Если ReloadKey задана, мод ставит "гибкие" патчи, которые читают настройки
 //   во время игры: проверка "машина игрока" всегда идёт через заглушку, а вставки
 //   громкости и приглушения мира ставятся сразу (при 100 они ничего не меняют).
-//   Отдельный поток раз в 50 мс смотрит на клавишу (только когда окно игры активно)
+//   Отдельный поток раз в 50 мс смотрит на клавишу в состоянии клавиатуры игры
 //   и перечитывает ini.
 //   Родной звук двигателя игрока играет на отдельном канале (номер в
 //   cAudioManager+3) и хранит своё состояние в статических переменных. Игра
@@ -489,7 +490,7 @@ static int ParseKey(const wchar_t* s) {
             if (s[i] < L'0' || s[i] > L'9') return VK_F7;
             num = num * 10 + (s[i] - L'0');
         }
-        return (num >= 1 && num <= 24) ? VK_F1 + num - 1 : VK_F7;
+        return (num >= 1 && num <= 12) ? VK_F1 + num - 1 : VK_F7;
     }
     if (n == 1 && ((c0 >= L'A' && c0 <= L'Z') || (c0 >= L'1' && c0 <= L'9'))) {
         return c0; // коды букв и цифр совпадают с ASCII
@@ -543,10 +544,6 @@ static void LoadConfig(HINSTANCE hinst) {
     }
     g_flexible = g_haveIni && g_reloadKey != 0;
     LogSettings("start: ");
-    LogLine l; l.n = 0;
-    LStr(l, "ReloadKey: ");
-    if (g_flexible) LHex(l, (unsigned)g_reloadKey); else LStr(l, "off");
-    LogWrite(l);
 }
 
 // Заменяет 6 байт "mov al, [esp+N]; mov ecx, ebx" на "call stub; nop".
@@ -1093,43 +1090,58 @@ static bool PatchIII() {
 
 // ---------------------------------------------
 
-// ---------- Перечитывание ini по клавише (GTA III и VC) ----------
+// ---------- Перечитывание ini по клавише ----------
+//
+// Клавиша читается из состояния клавиатуры самой игры (CPad::NewKeyState), как в
+// CLEO-модах, а не через Windows. Игра обновляет его только когда её окно активно,
+// так что клавиша работает только в игре. CKeyboardState одинаковый в III, VC и SA:
+//   +0x00 int16 F[12]               F1..F12
+//   +0x18 int16 standardKeys[256]   по коду символа: 'A'..'Z', 'a'..'z', '0'..'9'
+// Адреса NewKeyState (куда игра каждый кадр копирует TempKeyState, проверено по exe):
+//   III 0x6E60D0 (0x4929DF), VC 0x7D15A8 (0x4ABA8B), SA 0xB73190 (0x541E3C).
+// Буквы игра сама проверяет в обоих регистрах (SA 0x541360), мод делает так же.
 
-static bool IsGameForeground() {
-    HWND w = GetForegroundWindow();
-    if (!w) {
-        return false;
+static uintptr_t g_newKeyState = 0;
+
+// Поддерживаются F1..F12, A..Z, 0..9 (коды клавиш Windows).
+static bool IsGameKey(int vk) {
+    return (vk >= VK_F1 && vk <= VK_F12) || (vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9');
+}
+
+static bool GameKeyDown(int vk) {
+    const volatile int16_t* ks = (const volatile int16_t*)g_newKeyState;
+    if (vk >= VK_F1 && vk <= VK_F12) {
+        return ks[vk - VK_F1] != 0;
     }
-    DWORD pid = 0;
-    GetWindowThreadProcessId(w, &pid);
-    return pid == GetCurrentProcessId();
+    const volatile int16_t* std = ks + 12;
+    if (vk >= 'A' && vk <= 'Z') {
+        return std[vk] != 0 || std[vk + ('a' - 'A')] != 0;
+    }
+    if (vk >= '0' && vk <= '9') {
+        return std[vk] != 0;
+    }
+    return false;
 }
 
 static DWORD WINAPI ReloadThread(LPVOID) {
     bool wasDown = true; // не срабатывать, если клавиша зажата прямо при запуске
     for (;;) {
         Sleep(50);
-        const bool down = (GetAsyncKeyState(g_reloadKey) & 0x8000) != 0;
+        const bool down = GameKeyDown(g_reloadKey);
         if (down && !wasDown) {
-            if (IsGameForeground()) {
-                // В III и VC без вставки очереди старый канал не остановить,
-                // поэтому режим на ходу меняется только вместе с ней.
-                if (LoadSettings(g_canSwitch)) {
-                    g_resetPlayerEngine = 1; // III и VC: остановить старый канал на следующем кадре
-                }
-                LogSettings("ReloadKey pressed, reloaded: ");
-            } else {
-                LogLine l; l.n = 0;
-                LStr(l, "ReloadKey pressed, but the game window is not active - ignored");
-                LogWrite(l);
+            // В III и VC без вставки очереди старый канал не остановить,
+            // поэтому режим на ходу меняется только вместе с ней.
+            if (LoadSettings(g_canSwitch)) {
+                g_resetPlayerEngine = 1; // III и VC: остановить старый канал на следующем кадре
             }
+            LogSettings("ReloadKey pressed, reloaded: ");
         }
         wasDown = down;
     }
 }
 
 static void StartReloadThread() {
-    if (!g_flexible || !g_haveIni) {
+    if (!g_flexible || !g_haveIni || !g_newKeyState) {
         return;
     }
     HANDLE h = CreateThread(nullptr, 0, ReloadThread, nullptr, 0, nullptr);
@@ -1158,7 +1170,23 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID) {
     g_isSA = IsSA10US();
     LoadConfig(hinst);
 
+    // Клавиша читается из CPad::NewKeyState игры: там есть только F1..F12, буквы и цифры.
+    if (g_reloadKey != 0 && !IsGameKey(g_reloadKey)) {
+        LogLine l; l.n = 0;
+        LStr(l, "ReloadKey "); LHex(l, (unsigned)g_reloadKey);
+        LStr(l, " is not supported (use F1..F12, A..Z, 0..9), using F7");
+        LogWrite(l);
+        g_reloadKey = VK_F7;
+    }
+    {
+        LogLine l; l.n = 0;
+        LStr(l, "ReloadKey: ");
+        if (g_flexible) LHex(l, (unsigned)g_reloadKey); else LStr(l, "off");
+        LogWrite(l);
+    }
+
     if (g_isSA) {
+        g_newKeyState = 0xB73190;
         const bool ok = PatchSA();
         LogPatched("San Andreas 1.0 US", ok);
         if (ok) {
@@ -1169,6 +1197,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID) {
                  L"Возможно, exe изменён другим модом. Мод не будет включён.");
         }
     } else if (IsVC10()) {
+        g_newKeyState = 0x7D15A8;
         const bool ok = PatchVC();
         LogPatched("Vice City 1.0", ok);
         if (ok) {
@@ -1178,6 +1207,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID) {
                  L"Возможно, exe изменён другим модом. Мод не будет включён.");
         }
     } else if (IsIII10()) {
+        g_newKeyState = 0x6E60D0;
         const bool ok = PatchIII();
         LogPatched("GTA III 1.0", ok);
         if (ok) {

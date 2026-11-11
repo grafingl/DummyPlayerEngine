@@ -39,7 +39,7 @@ ReloadKey=F7
 
 - `VolumeSA` и `WorldVolumeSA` — то же самое для San Andreas. По умолчанию `100`, то есть мод не меняет громкость в SA: если хочется громче мотор или тише мир, поменяй эти строки.
 
-- `ReloadKey` — клавиша, по которой мод перечитывает ini прямо в игре: `F1`…`F24`, буква (`R`), цифра (`5`) или код клавиши Windows (`0x76`). `0` — выключить.
+- `ReloadKey` — клавиша, по которой мод перечитывает ini прямо в игре: `F1`…`F12`, буква (`R`), цифра (`5`) или их код (`118` или `0x76` — это F7, `112` — F1). `0` — выключить.
 
 Например, чтобы NPC-звук был только на мотоциклах, поставьте `Cars=0`, `Bikes=1`. В комплектном ini для GTA III и Vice City стоит `Volume=200` и `WorldVolume=60`, а для San Andreas — `100` (как в игре). Если какой-то строки нет, её значение `100`. Без файла настроек включено всё, громкость как в игре, а перечитывание выключено.
 
@@ -47,7 +47,7 @@ ReloadKey=F7
 
 Все настройки, кроме самой `ReloadKey`, можно менять, не выходя из игры: открой ini, поменяй цифры, сохрани, вернись в игру и нажми `ReloadKey` (по умолчанию `F7`). Можно переключать даже `Cars` и `Bikes`, сидя в машине: мод остановит старый звук двигателя и запустит новый с чистого состояния, как при пересадке.
 
-Клавиша срабатывает, только когда окно игры активно. Если `F7` уже занята другим модом или трейнером, поставь другую. С `ReloadKey=0` мод ставит минимум патчей, как раньше, а настройки меняются только перезапуском.
+Клавиша читается из состояния клавиатуры самой игры (`CPad::NewKeyState`: III `0x6E60D0`, VC `0x7D15A8`, SA `0xB73190`), как в CLEO-модах, поэтому срабатывает только в игре. Если `F7` уже занята другим модом или трейнером, поставь другую. С `ReloadKey=0` мод ставит минимум патчей, как раньше, а настройки меняются только перезапуском.
 
 ### Если что-то не работает
 
@@ -103,8 +103,11 @@ ReloadKey=F7
 zig c++ -target x86-windows-gnu -O2 -fno-exceptions -fno-rtti -fno-stack-protector -c DummyPlayerEngine.cpp -o d.o
 zig dlltool -m i386 -k -d kernel32.def -l kernel32.lib
 zig dlltool -m i386 -k -d user32.def -l user32.lib
-zig lld-link /dll /machine:x86 /entry:DllMain@12 /nodefaultlib /subsystem:windows /safeseh:no /out:DummyPlayerEngine.asi d.o kernel32.lib user32.lib
+zig rc DummyPlayerEngine.rc DummyPlayerEngine.res
+zig lld-link /dll /machine:x86 /entry:DllMain@12 /nodefaultlib /subsystem:windows /safeseh:no /dynamicbase /nxcompat /out:DummyPlayerEngine.asi d.o kernel32.lib user32.lib DummyPlayerEngine.res
 ```
+
+`DummyPlayerEngine.rc` — версионный ресурс (название, версия, автор, ссылка). Он даёт файлу нормальные метаданные, чтобы антивирусы реже принимали его за безымянный упакованный зловред.
 
 `kernel32.def`:
 ```
@@ -116,7 +119,6 @@ CreateThread@24
 DisableThreadLibraryCalls@4
 FlushInstructionCache@12
 GetCurrentProcess@0
-GetCurrentProcessId@0
 GetFileAttributesW@4
 GetModuleFileNameW@12
 GetPrivateProfileIntW@16
@@ -133,8 +135,9 @@ WriteFile@20
 ```
 LIBRARY USER32.dll
 EXPORTS
-GetAsyncKeyState@4
-GetForegroundWindow@0
-GetWindowThreadProcessId@8
 MessageBoxW@16
 ```
+
+## Лицензия
+
+[MIT](LICENSE) © 2026 grafingl. Можно свободно использовать, менять и распространять, сохраняя упоминание автора и текст лицензии.
