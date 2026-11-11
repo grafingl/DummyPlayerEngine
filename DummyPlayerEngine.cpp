@@ -12,10 +12,36 @@
 //   Bikes=1   мотоциклы (SA, VC)
 //   Quads=1   квадроциклы (только SA)
 // 1 = звук как у NPC, 0 = обычный звук игрока. Без файла всё включено.
-//   Volume=100  громкость NPC-звука двигателя игрока в процентах (только GTA III и VC).
+//   Volume=100  громкость NPC-звука двигателя игрока в процентах (GTA III и VC).
 //               100 = как у NPC. Итог ограничен максимумом игры (127).
 //   WorldVolume=100  громкость остальных звуков мира, пока игрок в транспорте, в процентах
-//               (только GTA III и VC). 100 = без изменений, 0 = тишина.
+//               (GTA III и VC). 100 = без изменений, 0 = тишина.
+//   VolumeSA=100, WorldVolumeSA=100  то же для San Andreas. Там проценты переводятся
+//               в дБ: 20 * log10(значение / 100).
+//   Если строки нет, значение 100, то есть как в игре.
+//   ReloadKey=F7  клавиша, по которой ini перечитывается прямо в игре (F1..F24, буква,
+//               цифра или код клавиши Windows). 0 = выключено. Сама ReloadKey читается
+//               только при запуске.
+//
+// Перечитывание на лету:
+//   San Andreas: вызовы ProcessPlayerVehicleEngine всегда идут через обёртку. При смене
+//   режима на ходу она повторяет то, что игра делает при посадке и выходе
+//   (JustGotInVehicleAsDriver / JustGotOutOfVehicleAsDriver), см. раздел SA ниже.
+// GTA III и VC:
+//   Если ReloadKey задана, мод ставит "гибкие" патчи, которые читают настройки
+//   во время игры: проверка "машина игрока" всегда идёт через заглушку, а вставки
+//   громкости и приглушения мира ставятся сразу (при 100 они ничего не меняют).
+//   Отдельный поток раз в 50 мс смотрит на клавишу (только когда окно игры активно)
+//   и перечитывает ini.
+//   Родной звук двигателя игрока играет на отдельном канале (номер в
+//   cAudioManager+3) и хранит своё состояние в статических переменных. Игра
+//   останавливает этот канал, когда игрок выходит из машины
+//   (cAudioManager::ProcessSpecial), и сбрасывает состояние, когда садится
+//   (флаг bPlayerJustEnteredCar). Если Cars или Bikes поменялись на ходу, мод
+//   на следующем кадре делает то же самое из вставки очереди звуков: зовёт
+//   cSampleManager::StopChannel для этого канала и ставит bPlayerJustEnteredCar.
+//   Без этого старый канал продолжает играть поверх нового звука.
+//   Если ReloadKey=0, мод ставит минимум патчей, как раньше.
 //
 // San Andreas:
 //   Если включено всё, в начало CAEVehicleAudioEntity::ProcessPlayerVehicleEngine
@@ -102,46 +128,172 @@ static void WriteJmp(uintptr_t from, uintptr_t to) {
 static bool g_cars  = true;
 static bool g_bikes = true;
 static bool g_quads = true;
+static bool g_isSA  = false; // San Andreas читает VolumeSA и WorldVolumeSA
 
 extern "C" {
     uint32_t dpe_volume __asm__("dpe_volume") = 100; // проценты
 }
 
+// San Andreas считает громкость в децибелах: те же проценты, переведённые в дБ.
+static float g_saVolumeDb = 0.0f; // прибавка к NPC-звуку двигателя игрока
+static float g_saWorldDb  = 0.0f; // приглушение мира (<= 0)
+
+// 20 * log10(pct / 100); 0% -> -100 дБ (в SA это тишина)
+static float PercentToDb(uint32_t pct) {
+    if (pct == 0) {
+        return -100.0f;
+    }
+    float r = (float)pct / 100.0f;
+    __asm__("fld1\n\tfxch\n\tfyl2x" : "=t"(r) : "0"(r)); // log2(r) без CRT
+    return r * 6.0205999f;                               // 20 * log10(2)
+}
+
 static uint32_t g_worldVolume = 100; // проценты, 0..100
+
+static int  g_reloadKey   = VK_F7; // 0 = перечитывание выключено
+static bool g_flexible    = false; // стоят патчи, которые читают настройки на лету
+static bool g_worldHooked = false; // стоит вставка очереди звуков (WorldVolume и сброс канала)
+static bool g_canSwitch   = false; // Cars/Bikes/Quads можно менять на ходу
+static bool g_volHooked   = false; // стоит вставка Volume (для журнала)
+
+// Сброс родного звука двигателя игрока после смены Cars/Bikes на ходу (GTA III и VC)
+static volatile uint8_t g_resetPlayerEngine = 0;
+static uintptr_t g_sampleManager   = 0; // cSampleManager SampleManager
+static uintptr_t g_stopChannel     = 0; // cSampleManager::StopChannel(int32)
+static uintptr_t g_justEnteredCar  = 0; // static bool bPlayerJustEnteredCar
+
+typedef void(__thiscall* StopChannelFn)(void* self, int32_t channel);
+
+// Флаги для asm-заглушек (имена без декорирования)
+extern "C" {
+    uint8_t dpe_vc_cars  __asm__("dpe_vc_cars")  = 1;
+    uint8_t dpe_vc_bikes __asm__("dpe_vc_bikes") = 1;
+    uint8_t dpe_iii_cars __asm__("dpe_iii_cars") = 1;
+}
+
+// ---------- Приглушение мира: общие правила ----------
+//
+// Чей звук, решается по владельцу, а не по расстоянию:
+//   - звуки машины игрока и самого игрока не трогаются;
+//   - звуки чужих машин приглушаются всегда, даже если машина проезжает вплотную
+//     (иначе на границе радиуса звук резко включался и выключался);
+//   - остальное (столкновения, взрывы, пешеходы, пассажиры) приглушается плавно
+//     по расстоянию до машины игрока: ближе DUCK_NEAR как в игре, дальше DUCK_FAR
+//     полностью, между ними постепенно. Так удары по своей машине и голоса
+//     пассажиров остаются слышны, а скачков громкости нет.
+
+static const float DUCK_NEAR = 5.0f;
+static const float DUCK_FAR  = 10.0f;
+
+// 0 = не приглушать, 1 = приглушить полностью
+static float DuckByDistance(const float* sound, const float* veh) {
+    const float dx = sound[0] - veh[0], dy = sound[1] - veh[1], dz = sound[2] - veh[2];
+    float d = dx * dx + dy * dy + dz * dz;
+    if (d <= DUCK_NEAR * DUCK_NEAR) return 0.0f;
+    if (d >= DUCK_FAR * DUCK_FAR)   return 1.0f;
+    __asm__("fsqrt" : "+t"(d)); // без CRT
+    return (d - DUCK_NEAR) / (DUCK_FAR - DUCK_NEAR);
+}
+
+// Плавное включение и выключение приглушения при посадке и выходе.
+// g_duckLevel идёт от 0 (пешком) до 1 (в машине) за DUCK_FADE_MS. Пока приглушение
+// затухает после выхода, правила считаются от последней машины игрока: её указатель
+// только сравнивается, а позиция берётся из копии.
+static const float DUCK_FADE_MS = 1000.0f;
+
+static float          g_duckLevel   = 0.0f;
+static DWORD          g_duckTick    = 0;
+static const uint8_t* g_lastVeh     = nullptr;
+static float          g_lastVehPos[3];
+
+// veh = машина игрока сейчас или nullptr; pos = её позиция. Возвращает уровень 0..1.
+static float UpdateDuck(const uint8_t* veh, const float* pos) {
+    const DWORD now = GetTickCount();
+    DWORD dt = now - g_duckTick;
+    g_duckTick = now;
+    if (dt > 100) dt = 100; // после паузы или загрузки не перескакивать
+    const float step = (float)dt / DUCK_FADE_MS;
+    if (veh) {
+        g_lastVeh = veh;
+        g_lastVehPos[0] = pos[0]; g_lastVehPos[1] = pos[1]; g_lastVehPos[2] = pos[2];
+        g_duckLevel = g_duckLevel + step < 1.0f ? g_duckLevel + step : 1.0f;
+    } else {
+        g_duckLevel = g_duckLevel - step > 0.0f ? g_duckLevel - step : 0.0f;
+    }
+    return g_duckLevel;
+}
 
 // ---------- Приглушение мира (GTA III и VC) ----------
 //
 // Почти все звуки мира ставятся в очередь через cAudioManager::AddSampleToRequestedQueue,
 // которая берёт уже заполненный m_sQueueSample. В начало этой функции ставится переход
 // на вставку, которая, пока игрок в транспорте, уменьшает громкость сэмпла
-// (m_nEmittingVolume и m_nVolume) на WorldVolume процентов. Не трогаются:
-//   - 2D-звуки (меню, интерфейс);
-//   - звуки ближе OWN_RADIUS метров к машине игрока: её двигатель, гудок, шины,
-//     двери, удары по ней. У всех звуков машины позиция сэмпла = позиция машины.
+// (m_nEmittingVolume и m_nVolume) по правилам выше. 2D-звуки (меню) не трогаются.
+// Владелец звука: cAudioManager::ProcessEntity пишет номер звукового объекта в
+// m_sQueueSample.m_nEntityIndex, объекты лежат в m_asAudioEntities (шаг 0x28):
+//   +0 m_nType (0 = AUDIOTYPE_PHYSICAL, тогда +4 - CEntity*), +8 m_bIsUsed.
+// Тип сущности: CEntity+0x50 & 7 (2 = машина).
 // Поля одинаковые в III и VC (проверено по дизассемблеру exe 1.0):
+//   this+0x14  m_sQueueSample.m_nEntityIndex
 //   this+0x21  m_sQueueSample.m_bIs2D
 //   this+0x2C  m_sQueueSample.m_nVolume
 //   this+0x40  m_sQueueSample.m_nEmittingVolume
 //   this+0x50  m_sQueueSample.m_vecPos
 //   veh+0x34   позиция машины (CPlaceable::m_matrix.pos)
+// Разное: m_asAudioEntities в this+0x1DC8 (III, 200 шт.) и this+0x1F10 (VC, 250 шт.).
 
-static const float OWN_RADIUS = 5.0f;
 static uintptr_t g_findPlayerVehicle = 0;
+static uintptr_t g_findPlayerPed     = 0;
+static uint32_t  g_audioEntities     = 0; // смещение m_asAudioEntities в cAudioManager
+static int32_t   g_audioEntityCount  = 0;
 
 extern "C" __attribute__((fastcall)) void DuckWorld(uint8_t* am) __asm__("dpe_duck_world");
 extern "C" __attribute__((fastcall)) void DuckWorld(uint8_t* am) {
-    uint8_t* veh = ((uint8_t*(__cdecl*)())g_findPlayerVehicle)();
-    if (!veh || am[0x21]) {
+    if (g_resetPlayerEngine) {
+        g_resetPlayerEngine = 0;
+        // Если игрок не в машине, игра сама всё остановит и сбросит при посадке.
+        if (((uint8_t*(__cdecl*)())g_findPlayerVehicle)()) {
+            // То же, что игра делает при выходе и посадке. Это начало функции,
+            // поэтому стек FPU пуст, как и при обычных вызовах StopChannel.
+            ((StopChannelFn)g_stopChannel)((void*)g_sampleManager, am[3]); // m_nActiveSamples
+            *(volatile uint8_t*)g_justEnteredCar = 1;
+        }
+    }
+    const uint32_t world = g_worldVolume;
+    if (world >= 100) {
         return;
     }
-    const float* s = (const float*)(am + 0x50);
-    const float* v = (const float*)(veh + 0x34);
-    const float dx = s[0] - v[0], dy = s[1] - v[1], dz = s[2] - v[2];
-    if (dx * dx + dy * dy + dz * dz < OWN_RADIUS * OWN_RADIUS) {
+    uint8_t* cur = ((uint8_t*(__cdecl*)())g_findPlayerVehicle)();
+    const float level = UpdateDuck(cur, cur ? (const float*)(cur + 0x34) : nullptr);
+    if (level <= 0.0f || am[0x21]) {
         return;
     }
-    am[0x40] = (uint8_t)(am[0x40] * g_worldVolume / 100);
-    am[0x2C] = (uint8_t)(am[0x2C] * g_worldVolume / 100);
+    const uint8_t* veh = g_lastVeh;      // только для сравнения
+    const float* vehPos = g_lastVehPos;
+    float factor = -1.0f; // ещё не решено
+    const int32_t idx = *(const int32_t*)(am + 0x14);
+    if (idx >= 0 && idx < g_audioEntityCount) {
+        const uint8_t* ae = am + g_audioEntities + (uint32_t)idx * 0x28;
+        // занят, активен (как проверяет ProcessEntity) и AUDIOTYPE_PHYSICAL: тогда +4 -
+        // живая сущность, которую игра в этом же кадре сама читает в ProcessPhysical
+        if (ae[8] && ae[9] && *(const int32_t*)ae == 0) {
+            const uint8_t* ent = *(uint8_t* const*)(ae + 4);
+            if (ent == veh || ent == ((uint8_t*(__cdecl*)())g_findPlayerPed)()) {
+                return;                           // своя машина или сам игрок
+            }
+            if (ent && (ent[0x50] & 7) == 2) {
+                factor = 1.0f;                    // чужая машина: всегда
+            }
+        }
+    }
+    if (factor < 0.0f) {
+        factor = DuckByDistance((const float*)(am + 0x50), vehPos);
+    }
+    factor *= level;
+    // world..100 процентов: 100 рядом, world далеко и у чужих машин
+    const uint32_t pct = 100 - (uint32_t)((float)(100 - world) * factor + 0.5f);
+    am[0x40] = (uint8_t)(am[0x40] * pct / 100);
+    am[0x2C] = (uint8_t)(am[0x2C] * pct / 100);
 }
 
 // Начало AddSampleToRequestedQueue переносится во вставку, после неё возврат назад.
@@ -189,34 +341,212 @@ static bool HookQueue(uintptr_t at, const uint8_t* orig, size_t size, void* stub
 static const uint8_t III_QUEUE_ORIGINAL[7] = { 0x53, 0x55, 0x89, 0xCD, 0x83, 0xEC, 0x08 };
 static const uint8_t VC_QUEUE_ORIGINAL[8]  = { 0x53, 0x56, 0x89, 0xCB, 0x55, 0x83, 0xEC, 0x18 };
 
-static void LoadConfig(HINSTANCE hinst) {
-    wchar_t path[MAX_PATH];
-    DWORD len = GetModuleFileNameW(hinst, path, MAX_PATH);
+static wchar_t g_iniPath[MAX_PATH];
+static bool    g_haveIni = false;
+static const wchar_t* const INI_SECTION = L"DummyPlayerEngine";
+
+// ...\DummyPlayerEngine.asi -> ...\DummyPlayerEngine.ini
+static void FindIni(HINSTANCE hinst) {
+    DWORD len = GetModuleFileNameW(hinst, g_iniPath, MAX_PATH);
     if (len == 0 || len >= MAX_PATH) {
         return;
     }
-    // ...\DummyPlayerEngine.asi -> ...\DummyPlayerEngine.ini
     DWORD dot = len;
-    while (dot > 0 && path[dot - 1] != L'.' && path[dot - 1] != L'\\' && path[dot - 1] != L'/') --dot;
-    if (dot == 0 || path[dot - 1] != L'.' || dot + 3 >= MAX_PATH) {
+    while (dot > 0 && g_iniPath[dot - 1] != L'.' && g_iniPath[dot - 1] != L'\\' && g_iniPath[dot - 1] != L'/') --dot;
+    if (dot == 0 || g_iniPath[dot - 1] != L'.' || dot + 3 >= MAX_PATH) {
         return;
     }
-    path[dot] = L'i'; path[dot + 1] = L'n'; path[dot + 2] = L'i'; path[dot + 3] = 0;
+    g_iniPath[dot] = L'i'; g_iniPath[dot + 1] = L'n'; g_iniPath[dot + 2] = L'i'; g_iniPath[dot + 3] = 0;
+    const DWORD attr = GetFileAttributesW(g_iniPath);
+    g_haveIni = attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+}
 
-    const wchar_t* sec = L"DummyPlayerEngine";
-    g_cars  = GetPrivateProfileIntW(sec, L"Cars",  1, path) != 0;
-    g_bikes = GetPrivateProfileIntW(sec, L"Bikes", 1, path) != 0;
-    g_quads = GetPrivateProfileIntW(sec, L"Quads", 1, path) != 0;
+// ---------- Журнал DummyPlayerEngine.log (рядом с .asi) ----------
+//
+// Какой ini найден, какие значения прочитаны, какие вставки стоят, нажатия ReloadKey.
+// Перезаписывается при каждом запуске игры. Пишется в UTF-8.
 
-    int vol = (int)GetPrivateProfileIntW(sec, L"Volume", 100, path);
+static wchar_t g_logPath[MAX_PATH];
+static bool    g_haveLog = false;
+
+struct LogLine {
+    char s[700];
+    int  n;
+};
+
+static void LStr(LogLine& l, const char* t) {
+    while (*t && l.n < (int)sizeof(l.s) - 3) l.s[l.n++] = *t++;
+}
+
+static void LInt(LogLine& l, int v) {
+    char tmp[12];
+    int k = 0;
+    unsigned u = v < 0 ? 0u - (unsigned)v : (unsigned)v;
+    do { tmp[k++] = (char)('0' + u % 10); u /= 10; } while (u && k < 11);
+    if (v < 0 && l.n < (int)sizeof(l.s) - 3) l.s[l.n++] = '-';
+    while (k > 0 && l.n < (int)sizeof(l.s) - 3) l.s[l.n++] = tmp[--k];
+}
+
+static void LHex(LogLine& l, unsigned v) {
+    LStr(l, "0x");
+    char tmp[8];
+    int k = 0;
+    do { tmp[k++] = "0123456789ABCDEF"[v & 15]; v >>= 4; } while (v && k < 8);
+    while (k > 0 && l.n < (int)sizeof(l.s) - 3) l.s[l.n++] = tmp[--k];
+}
+
+static void LPath(LogLine& l, const wchar_t* p) {
+    const int room = (int)sizeof(l.s) - 3 - l.n;
+    if (room <= 0) return;
+    const int w = WideCharToMultiByte(CP_UTF8, 0, p, -1, l.s + l.n, room, nullptr, nullptr);
+    if (w > 0) l.n += w - 1; // без завершающего нуля
+}
+
+static void LogWrite(LogLine& l) {
+    if (!g_haveLog) return;
+    l.s[l.n++] = '\r';
+    l.s[l.n++] = '\n';
+    HANDLE f = CreateFileW(g_logPath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD written;
+    WriteFile(f, l.s, (DWORD)l.n, &written, nullptr);
+    CloseHandle(f);
+}
+
+static void OpenLog() {
+    int i = 0;
+    while (g_iniPath[i] && i < MAX_PATH - 1) { g_logPath[i] = g_iniPath[i]; ++i; }
+    g_logPath[i] = 0;
+    if (i < 4) return;
+    g_logPath[i - 3] = L'l'; g_logPath[i - 2] = L'o'; g_logPath[i - 1] = L'g';
+    HANDLE f = CreateFileW(g_logPath, GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    static const char bom[3] = { (char)0xEF, (char)0xBB, (char)0xBF };
+    DWORD written;
+    WriteFile(f, bom, 3, &written, nullptr);
+    CloseHandle(f);
+    g_haveLog = true;
+}
+
+static void LogSettings(const char* prefix);
+
+// Настройки, которые можно менять на лету. Без файла всё по умолчанию.
+// allowModeChange = false: Cars/Bikes/Quads не трогаются. Возвращает true,
+// если Cars или Bikes поменялись.
+static bool LoadSettings(bool allowModeChange = true) {
+    if (!g_haveIni) {
+        return false;
+    }
+    const wchar_t* path = g_iniPath;
+    const bool cars  = GetPrivateProfileIntW(INI_SECTION, L"Cars",  1, path) != 0;
+    const bool bikes = GetPrivateProfileIntW(INI_SECTION, L"Bikes", 1, path) != 0;
+    const bool quads = GetPrivateProfileIntW(INI_SECTION, L"Quads", 1, path) != 0;
+    const bool changed = cars != g_cars || bikes != g_bikes;
+    if (allowModeChange) {
+        g_cars  = cars;
+        g_bikes = bikes;
+        g_quads = quads;
+    }
+
+    // У San Andreas свои строки громкости: там другой звуковой движок и шкала (дБ).
+    int vol = (int)GetPrivateProfileIntW(INI_SECTION, g_isSA ? L"VolumeSA" : L"Volume", 100, path);
     if (vol < 0)    vol = 0;
     if (vol > 1000) vol = 1000;
     dpe_volume = (uint32_t)vol;
 
-    int world = (int)GetPrivateProfileIntW(sec, L"WorldVolume", 100, path);
+    int world = (int)GetPrivateProfileIntW(INI_SECTION, g_isSA ? L"WorldVolumeSA" : L"WorldVolume", 100, path);
     if (world < 0)   world = 0;
     if (world > 100) world = 100;
     g_worldVolume = (uint32_t)world;
+
+    dpe_vc_cars  = g_cars  ? 1 : 0;
+    dpe_vc_bikes = g_bikes ? 1 : 0;
+    dpe_iii_cars = g_cars  ? 1 : 0;
+    g_saVolumeDb = PercentToDb(dpe_volume);
+    g_saWorldDb  = PercentToDb(g_worldVolume);
+    return allowModeChange && changed;
+}
+
+static wchar_t Upper(wchar_t c) {
+    return (c >= L'a' && c <= L'z') ? (wchar_t)(c - L'a' + L'A') : c;
+}
+
+// "F7", "f12", "R", "5", "0x76", "118", "0" -> код клавиши Windows (0 = выключено).
+// Непонятное значение -> F7.
+static int ParseKey(const wchar_t* s) {
+    while (*s == L' ' || *s == L'\t') ++s;
+    int n = 0;
+    while (s[n] && s[n] != L' ' && s[n] != L'\t' && s[n] != L';') ++n;
+    if (n == 0) {
+        return VK_F7;
+    }
+    const wchar_t c0 = Upper(s[0]);
+    if (c0 == L'F' && n >= 2 && n <= 3) {
+        int num = 0;
+        for (int i = 1; i < n; ++i) {
+            if (s[i] < L'0' || s[i] > L'9') return VK_F7;
+            num = num * 10 + (s[i] - L'0');
+        }
+        return (num >= 1 && num <= 24) ? VK_F1 + num - 1 : VK_F7;
+    }
+    if (n == 1 && ((c0 >= L'A' && c0 <= L'Z') || (c0 >= L'1' && c0 <= L'9'))) {
+        return c0; // коды букв и цифр совпадают с ASCII
+    }
+    int value = 0;
+    if (n > 2 && s[0] == L'0' && Upper(s[1]) == L'X') {
+        for (int i = 2; i < n; ++i) {
+            const wchar_t c = Upper(s[i]);
+            int d;
+            if (c >= L'0' && c <= L'9')      d = c - L'0';
+            else if (c >= L'A' && c <= L'F') d = c - L'A' + 10;
+            else return VK_F7;
+            value = value * 16 + d;
+            if (value > 0xFF) return VK_F7;
+        }
+        return value;
+    }
+    for (int i = 0; i < n; ++i) {
+        if (s[i] < L'0' || s[i] > L'9') return VK_F7;
+        value = value * 10 + (s[i] - L'0');
+        if (value > 0xFF) return VK_F7;
+    }
+    return value;
+}
+
+static void LogSettings(const char* prefix) {
+    LogLine l; l.n = 0;
+    LStr(l, prefix);
+    LStr(l, "Cars=");  LInt(l, g_cars);
+    LStr(l, " Bikes="); LInt(l, g_bikes);
+    LStr(l, " Quads="); LInt(l, g_quads);
+    LStr(l, g_isSA ? " VolumeSA=" : " Volume=");           LInt(l, (int)dpe_volume);
+    LStr(l, g_isSA ? " WorldVolumeSA=" : " WorldVolume=");  LInt(l, (int)g_worldVolume);
+    LogWrite(l);
+}
+
+static void LoadConfig(HINSTANCE hinst) {
+    FindIni(hinst);
+    OpenLog();
+    {
+        LogLine l; l.n = 0;
+        LStr(l, "ini: "); LPath(l, g_iniPath);
+        LStr(l, g_haveIni ? "  (found)" : "  (NOT FOUND - using defaults: no changes to volume)");
+        LogWrite(l);
+    }
+    LoadSettings();
+    if (g_haveIni) {
+        wchar_t buf[32];
+        GetPrivateProfileStringW(INI_SECTION, L"ReloadKey", L"F7", buf, 32, g_iniPath);
+        g_reloadKey = ParseKey(buf);
+    }
+    g_flexible = g_haveIni && g_reloadKey != 0;
+    LogSettings("start: ");
+    LogLine l; l.n = 0;
+    LStr(l, "ReloadKey: ");
+    if (g_flexible) LHex(l, (unsigned)g_reloadKey); else LStr(l, "off");
+    LogWrite(l);
 }
 
 // Заменяет 6 байт "mov al, [esp+N]; mov ecx, ebx" на "call stub; nop".
@@ -269,6 +599,23 @@ struct SaVehicleParams {
 };
 
 typedef void(__thiscall* SaEngineFn)(void* self, SaVehicleParams* vp);
+typedef void(__thiscall* SaEntityFn)(void* self);
+
+// Смена режима на ходу. CAEVehicleAudioEntity::Service (0x502280) при посадке игрока
+// водителем зовёт JustGotInVehicleAsDriver, при выходе JustGotOutOfVehicleAsDriver.
+// Они переводят состояние двигателя (this+0xA9) между "игроковскими" (3..6) и
+// "NPC" (0..2, 10) значениями и останавливают лишние звуки двигателя (0x4F55C0).
+// Мод повторяет то же самое:
+//   NPC -> игрок: JustGotIn, как при обычной посадке;
+//   игрок -> NPC: JustGotOut + JustGotIn, как при выходе и посадке, чтобы звуки
+//                 двигателя игрока остановились, а остальное (водитель, радио)
+//                 осталось как у водителя.
+static const uintptr_t SA_JUST_GOT_IN  = 0x4F5700; // CAEVehicleAudioEntity::JustGotInVehicleAsDriver
+static const uintptr_t SA_JUST_GOT_OUT = 0x4FCF40; // CAEVehicleAudioEntity::JustGotOutOfVehicleAsDriver
+
+static void* g_saLastSelf = nullptr; // только для сравнения, не разыменовывается
+static bool  g_saLastNpc  = false;
+static void* g_saPlayerDummySelf = nullptr; // машина игрока, пока для неё работает NPC-двигатель
 
 static void __fastcall SaEngineHook(void* self, void* /*edx*/, SaVehicleParams* vp) {
     bool npc;
@@ -277,7 +624,140 @@ static void __fastcall SaEngineHook(void* self, void* /*edx*/, SaVehicleParams* 
     case SA_VEHICLE_TYPE_QUAD: npc = g_quads; break;
     default:                   npc = g_cars;  break;
     }
-    ((SaEngineFn)(npc ? SA_DUMMY_ENGINE : SA_PLAYER_ENGINE))(self, vp);
+    if (g_flexible) {
+        if (self == g_saLastSelf && npc != g_saLastNpc) {
+            if (npc) {
+                ((SaEntityFn)SA_JUST_GOT_OUT)(self);
+            }
+            ((SaEntityFn)SA_JUST_GOT_IN)(self);
+        }
+        g_saLastSelf = self;
+        g_saLastNpc  = npc;
+    }
+    if (npc) {
+        g_saPlayerDummySelf = self; // для Volume: сейчас считается NPC-звук машины игрока
+        ((SaEngineFn)SA_DUMMY_ENGINE)(self, vp);
+        g_saPlayerDummySelf = nullptr;
+    } else {
+        ((SaEngineFn)SA_PLAYER_ENGINE)(self, vp);
+    }
+}
+
+// ---------- Громкость в San Andreas ----------
+//
+// Volume: громкость NPC-звука двигателя считают CAEVehicleAudioEntity::GetVolumeForDummyIdle
+// (0x4F51F0) и GetVolumeForDummyRev (0x4F53D0), обе в дБ. Их вызывают только из перехода
+// состояний NPC-двигателя (0x4FCA10..0x4FCF3C, по 5 вызовов). Вызовы перенаправляются на
+// обёртки, которые прибавляют g_saVolumeDb, если сейчас считается машина игрока.
+//
+// WorldVolume: итоговую громкость каждого звука считает CAESound::CalculateVolume (0x4EFA10),
+// её вызывает только цикл CAESoundManager::Service (0x4F041A). После неё мод, пока игрок
+// в транспорте, вычитает приглушение из m_fFinalVolume (+0x60) по общим правилам.
+// Фронтенд-звуки (m_nEnvironmentFlags & 1, +0x56: меню, интерфейс) не трогаются.
+// Владелец звука: CAEAudioEntity (+4), его CEntity (+4 у владельца); объект звука (+8).
+// Указатели только сравниваются, чужая ли это машина - проверяется по пулу машин
+// (SaIsVehicle). Позиция звука: +0x24.
+
+static const uintptr_t SA_DUMMY_IDLE_VOL      = 0x4F51F0;
+static const uintptr_t SA_DUMMY_REV_VOL       = 0x4F53D0;
+static const uintptr_t SA_DUMMY_TRANSITION    = 0x4FCA10;
+static const uintptr_t SA_DUMMY_TRANSITION_E  = 0x4FCF3C;
+static const uintptr_t SA_CALC_VOLUME         = 0x4EFA10; // CAESound::CalculateVolume
+static const uintptr_t SA_CALC_VOLUME_CALL    = 0x4F041A; // в CAESoundManager::Service
+static const uintptr_t SA_FIND_PLAYER_VEHICLE = 0x4D9E10; // CAEAudioUtility::FindVehicleOfPlayer
+static const uintptr_t SA_FIND_PLAYER_PED     = 0x56E210; // FindPlayerPed(int32 playerId = -1)
+
+typedef float(__thiscall* SaDummyVolFn)(void* self, float a, float b);
+
+static float __fastcall SaDummyIdleVolHook(void* self, void* /*edx*/, float a, float b) {
+    float v = ((SaDummyVolFn)SA_DUMMY_IDLE_VOL)(self, a, b);
+    if (self == g_saPlayerDummySelf) v += g_saVolumeDb;
+    return v;
+}
+
+static float __fastcall SaDummyRevVolHook(void* self, void* /*edx*/, float a, float b) {
+    float v = ((SaDummyVolFn)SA_DUMMY_REV_VOL)(self, a, b);
+    if (self == g_saPlayerDummySelf) v += g_saVolumeDb;
+    return v;
+}
+
+// Это машина? Проверка только по адресу: указатель лежит внутри пула машин
+// (CPools::ms_pVehiclePool, 0xB74494; элемент 0xA18 байт, как в коде игры по 0x4320C2)
+// и ячейка занята. По самому указателю ничего не читается: у некоторых звуковых
+// объектов SA поле "сущность" - не указатель на сущность, и чтение по нему роняло игру.
+struct SaPool {
+    uint8_t* objects;
+    int8_t*  flags;   // старший бит = ячейка свободна
+    int32_t  size;
+};
+static const uintptr_t SA_VEHICLE_POOL      = 0xB74494;
+static const uint32_t  SA_VEHICLE_POOL_ITEM = 0xA18;
+
+static bool SaIsVehicle(const uint8_t* p) {
+    const SaPool* pool = *(SaPool* const*)SA_VEHICLE_POOL;
+    if (!p || !pool || !pool->objects || !pool->flags || pool->size <= 0) {
+        return false;
+    }
+    const uintptr_t off = (uintptr_t)p - (uintptr_t)pool->objects;
+    if (off >= (uintptr_t)pool->size * SA_VEHICLE_POOL_ITEM || off % SA_VEHICLE_POOL_ITEM) {
+        return false;
+    }
+    return pool->flags[off / SA_VEHICLE_POOL_ITEM] >= 0;
+}
+
+static void __fastcall SaCalcVolumeHook(uint8_t* sound) {
+    ((SaEntityFn)SA_CALC_VOLUME)(sound);
+    const float duck = g_saWorldDb;
+    if (duck >= 0.0f || (*(const uint16_t*)(sound + 0x56) & 1)) {
+        return;
+    }
+    uint8_t* cur = ((uint8_t*(__cdecl*)())SA_FIND_PLAYER_VEHICLE)();
+    const float* curPos = nullptr;
+    if (cur) {
+        const float* m = *(const float* const*)(cur + 0x14);     // CMatrix*
+        curPos = m ? m + 12 : (const float*)(cur + 4);           // позиция машины
+    }
+    const float level = UpdateDuck(cur, curPos);
+    if (level <= 0.0f) {
+        return;
+    }
+    const uint8_t* veh = g_lastVeh;                              // только для сравнения
+    uint8_t* ped = ((uint8_t*(__cdecl*)(int32_t))SA_FIND_PLAYER_PED)(-1);
+    const uint8_t* owner    = *(uint8_t* const*)(sound + 4);
+    const uint8_t* ownerEnt = owner ? *(uint8_t* const*)(owner + 4) : nullptr;
+    const uint8_t* phys     = *(uint8_t* const*)(sound + 8);
+    if (ownerEnt == veh || phys == veh || (ped && (ownerEnt == ped || phys == ped))) {
+        return;                                                  // своя машина или сам игрок
+    }
+    float factor;
+    if (SaIsVehicle(ownerEnt) || SaIsVehicle(phys)) {
+        factor = 1.0f;                                           // чужая машина: всегда
+    } else {
+        factor = DuckByDistance((const float*)(sound + 0x24), g_lastVehPos);
+    }
+    *(float*)(sound + 0x60) += duck * factor * level;
+}
+
+// Перенаправляет все "call target" в [lo, hi) на hook. Возвращает число вызовов.
+static int RedirectCalls(uintptr_t lo, uintptr_t hi, uintptr_t target, const void* hook, bool write) {
+    int count = 0;
+    for (uintptr_t a = lo; a + 5 <= hi; ++a) {
+        const uint8_t* p = (const uint8_t*)a;
+        if (p[0] != 0xE8) continue;
+        const int32_t rel = *(const int32_t*)(p + 1);
+        if (a + 5 + rel != target) continue;
+        if (write) {
+            const int32_t newRel = (int32_t)((uintptr_t)hook - (a + 5));
+            const uint8_t call[5] = {
+                0xE8,
+                (uint8_t)(newRel), (uint8_t)(newRel >> 8), (uint8_t)(newRel >> 16), (uint8_t)(newRel >> 24),
+            };
+            WriteBytes(a, call, sizeof(call));
+        }
+        ++count;
+        a += 4;
+    }
+    return count;
 }
 
 static bool IsSA10US() {
@@ -285,32 +765,48 @@ static bool IsSA10US() {
 }
 
 static bool PatchSA() {
-    if (g_cars && g_bikes && g_quads) {
+    const bool needWrapper = g_flexible || dpe_volume != 100; // Volume работает через обёртку
+    if (!needWrapper && g_cars && g_bikes && g_quads) {
         WriteJmp(SA_PLAYER_ENGINE, SA_DUMMY_ENGINE);
-        return true;
-    }
-    if (!g_cars && !g_bikes && !g_quads) {
-        return true; // всё обычное, ничего не трогаем
+    } else if (needWrapper || g_cars || g_bikes || g_quads) {
+        // Вызовы ProcessPlayerVehicleEngine внутри ProcessVehicle -> обёртка.
+        if (RedirectCalls(SA_PROCESS_VEHICLE, SA_PROCESS_VEHICLE_E, SA_PLAYER_ENGINE,
+                          (const void*)&SaEngineHook, true) == 0) {
+            return false;
+        }
     }
 
-    // Перенаправляем вызовы ProcessPlayerVehicleEngine внутри ProcessVehicle на обёртку.
-    int patched = 0;
-    for (uintptr_t a = SA_PROCESS_VEHICLE; a + 5 <= SA_PROCESS_VEHICLE_E; ++a) {
-        const uint8_t* p = (const uint8_t*)a;
-        if (p[0] != 0xE8) continue;
-        const int32_t rel = *(const int32_t*)(p + 1);
-        if (a + 5 + rel != SA_PLAYER_ENGINE) continue;
+    if (needWrapper) {
+        const bool ok =
+            RedirectCalls(SA_DUMMY_TRANSITION, SA_DUMMY_TRANSITION_E, SA_DUMMY_IDLE_VOL, nullptr, false) == 5 &&
+            RedirectCalls(SA_DUMMY_TRANSITION, SA_DUMMY_TRANSITION_E, SA_DUMMY_REV_VOL,  nullptr, false) == 5;
+        if (ok) {
+            RedirectCalls(SA_DUMMY_TRANSITION, SA_DUMMY_TRANSITION_E, SA_DUMMY_IDLE_VOL,
+                          (const void*)&SaDummyIdleVolHook, true);
+            RedirectCalls(SA_DUMMY_TRANSITION, SA_DUMMY_TRANSITION_E, SA_DUMMY_REV_VOL,
+                          (const void*)&SaDummyRevVolHook, true);
+            g_volHooked = true;
+        } else if (dpe_volume != 100) {
+            Warn(L"DummyPlayerEngine: место для громкости в San Andreas не совпадает с версией 1.0 US\n"
+                 L"(возможно, его уже изменил другой мод). Звук двигателя работает, но настройка Volume не применена.");
+        }
+    }
 
-        const int32_t newRel = (int32_t)((uintptr_t)&SaEngineHook - (a + 5));
-        const uint8_t call[5] = {
-            0xE8,
-            (uint8_t)(newRel), (uint8_t)(newRel >> 8), (uint8_t)(newRel >> 16), (uint8_t)(newRel >> 24),
+    if (g_flexible || g_worldVolume != 100) {
+        const int32_t rel = (int32_t)(SA_CALC_VOLUME - (SA_CALC_VOLUME_CALL + 5));
+        const uint8_t orig[5] = {
+            0xE8, (uint8_t)(rel), (uint8_t)(rel >> 8), (uint8_t)(rel >> 16), (uint8_t)(rel >> 24),
         };
-        WriteBytes(a, call, sizeof(call));
-        ++patched;
-        a += 4;
+        if (BytesEqual(SA_CALC_VOLUME_CALL, orig, sizeof(orig))) {
+            RedirectCalls(SA_CALC_VOLUME_CALL, SA_CALC_VOLUME_CALL + 5, SA_CALC_VOLUME,
+                          (const void*)&SaCalcVolumeHook, true);
+            g_worldHooked = true;
+        } else if (g_worldVolume != 100) {
+            Warn(L"DummyPlayerEngine: расчёт громкости звуков в San Andreas не совпадает с версией 1.0 US\n"
+                 L"(возможно, его уже изменил другой мод). Настройка WorldVolume не применена.");
+        }
     }
-    return patched > 0;
+    return true;
 }
 
 // ---------- GTA Vice City 1.0 ----------
@@ -342,8 +838,6 @@ static const uintptr_t VC_JE          = 0x5F218A;
 
 // Данные для заглушки (имена без декорирования, чтобы сослаться из asm)
 extern "C" {
-    uint8_t   dpe_vc_cars    __asm__("dpe_vc_cars")    = 1;
-    uint8_t   dpe_vc_bikes   __asm__("dpe_vc_bikes")   = 1;
     uintptr_t dpe_vc_npc     __asm__("dpe_vc_npc")     = 0x5F21A0; // ветка NPC
     uintptr_t dpe_vc_player  __asm__("dpe_vc_player")  = 0x5F218C; // ветка игрока
 }
@@ -421,12 +915,10 @@ static bool PatchVC() {
     if (!BytesEqual(VC_SITE, VC_ORIGINAL, sizeof(VC_ORIGINAL))) {
         return false;
     }
-    if (g_cars && g_bikes) {
+    if (!g_flexible && g_cars && g_bikes) {
         static const uint8_t jmpShort[1] = { 0xEB }; // je -> jmp
         WriteBytes(VC_JE, jmpShort, sizeof(jmpShort));
-    } else if (g_cars || g_bikes) {
-        dpe_vc_cars  = g_cars  ? 1 : 0;
-        dpe_vc_bikes = g_bikes ? 1 : 0;
+    } else if (g_flexible || g_cars || g_bikes) {
         uint8_t code[11];
         const int32_t rel = (int32_t)((uintptr_t)&VcTypeStub - (VC_CADDY_CHECK + 5));
         code[0] = 0xE9;
@@ -435,17 +927,27 @@ static bool PatchVC() {
         for (int i = 5; i < 11; ++i) code[i] = 0x90; // nop
         WriteBytes(VC_CADDY_CHECK, code, sizeof(code));
     }
-    if (dpe_volume != 100 && (g_cars || g_bikes)) {
+    if (g_flexible || (dpe_volume != 100 && (g_cars || g_bikes))) {
         if (BytesEqual(VC_VOL_SITE, VC_VOL_ORIGINAL, sizeof(VC_VOL_ORIGINAL))) {
             WriteVolumeCall(VC_VOL_CALL, (void*)&VcVolStub);
-        } else {
+            g_volHooked = true;
+        } else if (dpe_volume != 100) {
             Warn(L"DummyPlayerEngine: место для громкости в Vice City не совпадает с версией 1.0.\n"
                  L"Звук двигателя работает, но настройка Volume не применена.");
         }
     }
-    if (g_worldVolume != 100) {
+    if (g_flexible || g_worldVolume != 100) {
         g_findPlayerVehicle = 0x4BC1E0;
-        if (!HookQueue(0x5F7560, VC_QUEUE_ORIGINAL, sizeof(VC_QUEUE_ORIGINAL), (void*)&VcQueueStub)) {
+        g_findPlayerPed     = 0x4BC120;
+        g_audioEntities     = 0x1F10;
+        g_audioEntityCount  = 250;
+        g_sampleManager     = 0x983B90;
+        g_stopChannel       = 0x5D6530;
+        g_justEnteredCar    = 0x7838CD;
+        if (HookQueue(0x5F7560, VC_QUEUE_ORIGINAL, sizeof(VC_QUEUE_ORIGINAL), (void*)&VcQueueStub)) {
+            g_worldHooked = true;
+            g_canSwitch   = g_flexible;
+        } else if (g_worldVolume != 100) {
             Warn(L"DummyPlayerEngine: очередь звуков Vice City не совпадает с версией 1.0\n"
                  L"(возможно, её уже изменил другой мод). Настройка WorldVolume не применена.");
         }
@@ -477,6 +979,33 @@ static const uint8_t III_ORIGINAL[] = {
     0xE8, 0x02, 0x0A, 0x00, 0x00,       // call 0x56B0D0
 };
 static const uintptr_t III_JNE = 0x56A6BF;
+
+// Гибкий вариант: "cmp eax, ebp; fldz x4; jne npc" (0x56A6B5..0x56A6C0, 12 байт)
+// заменяется на "jmp dpe_iii_stub" + 7 nop. Заглушка делает то же самое, но машину
+// игрока отправляет в ветку NPC, только если включено Cars. fldz флаги не меняет,
+// ветка NPC (0x56A6D3) флаги не читает, внутрь заменённых байт никто не прыгает
+// (проверено по дизассемблеру gta3.exe 1.0).
+extern "C" {
+    uintptr_t dpe_iii_npc    __asm__("dpe_iii_npc")    = 0x56A6D3; // ветка NPC
+    uintptr_t dpe_iii_player __asm__("dpe_iii_player") = 0x56A6C1; // ветка игрока
+}
+extern "C" void IIIBranchStub() __asm__("dpe_iii_stub");
+__asm__(
+    ".text\n"
+    ".globl dpe_iii_stub\n"
+    "dpe_iii_stub:\n"
+    "    fldz\n"
+    "    fldz\n"
+    "    fldz\n"
+    "    fldz\n"
+    "    cmpl   %ebp, %eax\n"            // FindPlayerVehicle() == veh ?
+    "    jne    1f\n"                    // не машина игрока -> NPC
+    "    cmpb   $0, dpe_iii_cars\n"
+    "    jne    1f\n"                    // Cars=1 -> NPC
+    "    jmp    *dpe_iii_player\n"
+    "1:\n"
+    "    jmp    *dpe_iii_npc\n"
+);
 
 // Громкость. Код 0x56AA66..0x56AA79 (ветка NPC, esp+8 = emittingVol, ebp = машина):
 //   fcompp; fcompp
@@ -526,22 +1055,35 @@ static bool PatchIII() {
     if (!BytesEqual(III_SITE, III_ORIGINAL, sizeof(III_ORIGINAL))) {
         return false;
     }
-    if (g_cars) {
+    if (g_flexible) {
+        static const uint8_t nops[7] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+        WriteJmp(III_SITE, (uintptr_t)&IIIBranchStub);
+        WriteBytes(III_SITE + 5, nops, sizeof(nops));
+    } else if (g_cars) {
         static const uint8_t jmpShort[1] = { 0xEB }; // jne -> jmp
         WriteBytes(III_JNE, jmpShort, sizeof(jmpShort));
-
-        if (dpe_volume != 100) {
-            if (BytesEqual(III_VOL_SITE, III_VOL_ORIGINAL, sizeof(III_VOL_ORIGINAL))) {
-                WriteVolumeCall(III_VOL_CALL, (void*)&IIIVolStub);
-            } else {
-                Warn(L"DummyPlayerEngine: место для громкости в GTA III не совпадает с версией 1.0.\n"
-                     L"Звук двигателя работает, но настройка Volume не применена.");
-            }
+    }
+    if (g_flexible || (g_cars && dpe_volume != 100)) {
+        if (BytesEqual(III_VOL_SITE, III_VOL_ORIGINAL, sizeof(III_VOL_ORIGINAL))) {
+            WriteVolumeCall(III_VOL_CALL, (void*)&IIIVolStub);
+            g_volHooked = true;
+        } else if (dpe_volume != 100) {
+            Warn(L"DummyPlayerEngine: место для громкости в GTA III не совпадает с версией 1.0.\n"
+                 L"Звук двигателя работает, но настройка Volume не применена.");
         }
     }
-    if (g_worldVolume != 100) {
+    if (g_flexible || g_worldVolume != 100) {
         g_findPlayerVehicle = 0x4A10C0;
-        if (!HookQueue(0x57B070, III_QUEUE_ORIGINAL, sizeof(III_QUEUE_ORIGINAL), (void*)&IIIQueueStub)) {
+        g_findPlayerPed     = 0x4A1150;
+        g_audioEntities     = 0x1DC8;
+        g_audioEntityCount  = 200;
+        g_sampleManager     = 0x7341E0;
+        g_stopChannel       = 0x567BE0;
+        g_justEnteredCar    = 0x6508C4;
+        if (HookQueue(0x57B070, III_QUEUE_ORIGINAL, sizeof(III_QUEUE_ORIGINAL), (void*)&IIIQueueStub)) {
+            g_worldHooked = true;
+            g_canSwitch   = g_flexible;
+        } else if (g_worldVolume != 100) {
             Warn(L"DummyPlayerEngine: очередь звуков GTA III не совпадает с версией 1.0\n"
                  L"(возможно, её уже изменил другой мод). Настройка WorldVolume не применена.");
         }
@@ -551,29 +1093,101 @@ static bool PatchIII() {
 
 // ---------------------------------------------
 
+// ---------- Перечитывание ini по клавише (GTA III и VC) ----------
+
+static bool IsGameForeground() {
+    HWND w = GetForegroundWindow();
+    if (!w) {
+        return false;
+    }
+    DWORD pid = 0;
+    GetWindowThreadProcessId(w, &pid);
+    return pid == GetCurrentProcessId();
+}
+
+static DWORD WINAPI ReloadThread(LPVOID) {
+    bool wasDown = true; // не срабатывать, если клавиша зажата прямо при запуске
+    for (;;) {
+        Sleep(50);
+        const bool down = (GetAsyncKeyState(g_reloadKey) & 0x8000) != 0;
+        if (down && !wasDown) {
+            if (IsGameForeground()) {
+                // В III и VC без вставки очереди старый канал не остановить,
+                // поэтому режим на ходу меняется только вместе с ней.
+                if (LoadSettings(g_canSwitch)) {
+                    g_resetPlayerEngine = 1; // III и VC: остановить старый канал на следующем кадре
+                }
+                LogSettings("ReloadKey pressed, reloaded: ");
+            } else {
+                LogLine l; l.n = 0;
+                LStr(l, "ReloadKey pressed, but the game window is not active - ignored");
+                LogWrite(l);
+            }
+        }
+        wasDown = down;
+    }
+}
+
+static void StartReloadThread() {
+    if (!g_flexible || !g_haveIni) {
+        return;
+    }
+    HANDLE h = CreateThread(nullptr, 0, ReloadThread, nullptr, 0, nullptr);
+    if (h) {
+        CloseHandle(h);
+    }
+}
+
+static void LogPatched(const char* game, bool ok) {
+    LogLine l; l.n = 0;
+    LStr(l, "game: "); LStr(l, game);
+    LStr(l, ok ? ", engine patch OK" : ", engine patch FAILED");
+    LStr(l, ", world hook: "); LStr(l, g_worldHooked ? "yes" : "no");
+    LStr(l, ", volume hook: "); LStr(l, g_volHooked ? "yes" : "no");
+    LStr(l, ", reload thread: "); LStr(l, (ok && g_flexible && g_haveIni) ? "on" : "off");
+    LogWrite(l);
+}
+
+// ---------------------------------------------
+
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID) {
     if (reason != DLL_PROCESS_ATTACH) {
         return TRUE;
     }
     DisableThreadLibraryCalls(hinst);
+    g_isSA = IsSA10US();
     LoadConfig(hinst);
 
-    if (IsSA10US()) {
-        if (!PatchSA()) {
+    if (g_isSA) {
+        const bool ok = PatchSA();
+        LogPatched("San Andreas 1.0 US", ok);
+        if (ok) {
+            g_canSwitch = g_flexible; // обёртка сама переводит звук при смене режима
+            StartReloadThread();
+        } else {
             Warn(L"DummyPlayerEngine: не найдены нужные места в коде San Andreas.\n"
                  L"Возможно, exe изменён другим модом. Мод не будет включён.");
         }
     } else if (IsVC10()) {
-        if (!PatchVC()) {
+        const bool ok = PatchVC();
+        LogPatched("Vice City 1.0", ok);
+        if (ok) {
+            StartReloadThread();
+        } else {
             Warn(L"DummyPlayerEngine: код Vice City не совпадает с версией 1.0.\n"
                  L"Возможно, exe изменён другим модом. Мод не будет включён.");
         }
     } else if (IsIII10()) {
-        if (!PatchIII()) {
+        const bool ok = PatchIII();
+        LogPatched("GTA III 1.0", ok);
+        if (ok) {
+            StartReloadThread();
+        } else {
             Warn(L"DummyPlayerEngine: код GTA III не совпадает с версией 1.0.\n"
                  L"Возможно, exe изменён другим модом. Мод не будет включён.");
         }
     } else {
+        LogPatched("unsupported game or version", false);
         Warn(L"DummyPlayerEngine: поддерживаются GTA San Andreas 1.0 US, GTA Vice City 1.0 и GTA III 1.0.\n"
              L"Мод не будет включён.");
     }
